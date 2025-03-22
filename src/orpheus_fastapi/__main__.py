@@ -100,14 +100,12 @@ async def create_speech_api(app_request: Request, speech_request: SpeechRequest)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = OUTPUTS_PATH / f"{speech_request.voice}_{timestamp}.wav"
    
-    output_url = urljoin('/outputs/', output_path.name)
-
     # Generate speech
     start = time.time()
     generate_speech_from_api(
         prompt=speech_request.input,
         voice=speech_request.voice,
-        output_file=str(output_url),
+        output_file=str(output_path),
         api_url=app_request.app.config.api_url,
     )
     end = time.time()
@@ -117,7 +115,7 @@ async def create_speech_api(app_request: Request, speech_request: SpeechRequest)
     return FileResponse(
         path=str(output_path),
         media_type="audio/wav",
-        filename=f"{speech_request.voice}_{timestamp}.wav"
+        filename=output_path.name,
     )
 
 # Legacy API endpoint for compatibility
@@ -148,7 +146,7 @@ async def speak(request: Request):
     return JSONResponse(content={
         "status": "ok",
         "voice": voice,
-        "output_file": str(output_url),
+        "output_file": output_url,
         "generation_time": generation_time
     })
 
@@ -204,7 +202,7 @@ async def generate_from_web(
             "success": True,
             "text": text,
             "voice": voice,
-            "output_file": str(output_url),
+            "output_file": output_url,
             "generation_time": generation_time,
             "voices": AVAILABLE_VOICES
         }
@@ -267,5 +265,5 @@ def main():
     print(f"    Using OpenAI compatible Orpheus text generation API at {app.config.api_url}")
     print(f"    Using output directory {OUTPUTS_PATH}")
 
-    uvicorn.run(f"{__name__}:app", host="0.0.0.0", port=5005, reload=True, log_level='trace')
+    uvicorn.run(f"{__name__}:app", host="0.0.0.0", port=5005, reload=True)
 
