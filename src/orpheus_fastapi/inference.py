@@ -23,8 +23,9 @@ if torch.cuda.is_available():
         print(f"High-end GPU detected: {torch.cuda.get_device_name(0)}")
         print("Enabling high-performance optimizations")
 
+DEFAULT_API_URL = "http://127.0.0.1:1337/v1/completions"
+
 # Orpheus-FASTAPI settings - make configurable for different endpoints
-API_URL = os.environ.get("ORPHEUS_API_URL", "http://your-server-ip:port/v1/completions or v1/chat/completions")
 HEADERS = {
     "Content-Type": "application/json"
 }
@@ -109,7 +110,8 @@ def format_prompt(prompt: str, voice: str = DEFAULT_VOICE) -> str:
 
 def generate_tokens_from_api(prompt: str, voice: str = DEFAULT_VOICE, temperature: float = TEMPERATURE, 
                            top_p: float = TOP_P, max_tokens: int = MAX_TOKENS, 
-                           repetition_penalty: float = REPETITION_PENALTY) -> Generator[str, None, None]:
+                           repetition_penalty: float = REPETITION_PENALTY,
+                           api_url: str=DEFAULT_API_URL) -> Generator[str, None, None]:
     """Generate tokens from text using OpenAI-compatible API with optimized streaming and retry logic."""
     start_time = time.time()
     formatted_prompt = format_prompt(prompt, voice)
@@ -141,7 +143,7 @@ def generate_tokens_from_api(prompt: str, voice: str = DEFAULT_VOICE, temperatur
         try:
             # Make the API request with streaming and timeout
             response = session.post(
-                API_URL, 
+                api_url, 
                 headers=HEADERS, 
                 json=payload, 
                 stream=True,
@@ -205,7 +207,7 @@ def generate_tokens_from_api(prompt: str, voice: str = DEFAULT_VOICE, temperatur
                 return
                 
         except requests.exceptions.ConnectionError:
-            print(f"Connection error to API at {API_URL}")
+            print(f"Connection error to API at {api_url}")
             retry_count += 1
             if retry_count < max_retries:
                 wait_time = 2 ** retry_count
@@ -462,7 +464,7 @@ def stream_audio(audio_buffer):
         print(f"Audio playback error: {e}")
 
 def generate_speech_from_api(prompt, voice=DEFAULT_VOICE, output_file=None, temperature=TEMPERATURE, 
-                     top_p=TOP_P, max_tokens=MAX_TOKENS, repetition_penalty=REPETITION_PENALTY):
+                             top_p=TOP_P, max_tokens=MAX_TOKENS, repetition_penalty=REPETITION_PENALTY, api_url: str=DEFAULT_API_URL):
     """Generate speech from text using Orpheus model with performance optimizations."""
     print(f"Starting speech generation for '{prompt[:50]}{'...' if len(prompt) > 50 else ''}'")
     print(f"Using voice: {voice}, GPU acceleration: {'Yes (High-end)' if HIGH_END_GPU else 'Yes' if torch.cuda.is_available() else 'No'}")
@@ -481,7 +483,8 @@ def generate_speech_from_api(prompt, voice=DEFAULT_VOICE, output_file=None, temp
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
-            repetition_penalty=repetition_penalty
+            repetition_penalty=repetition_penalty,
+            api_url=api_url,
         ),
         output_file=output_file
     )
@@ -510,6 +513,7 @@ def main():
     parser.add_argument("--text", type=str, help="Text to convert to speech")
     parser.add_argument("--voice", type=str, default=DEFAULT_VOICE, help=f"Voice to use (default: {DEFAULT_VOICE})")
     parser.add_argument("--output", type=str, help="Output WAV file path")
+    parser.add_argument("--api-url", type=str, default=DEFAULT_API_URL, help="Inference server API URL")
     parser.add_argument("--list-voices", action="store_true", help="List available voices")
     parser.add_argument("--temperature", type=float, default=TEMPERATURE, help="Temperature for generation")
     parser.add_argument("--top_p", type=float, default=TOP_P, help="Top-p sampling parameter")
@@ -550,7 +554,8 @@ def main():
         temperature=args.temperature,
         top_p=args.top_p,
         repetition_penalty=args.repetition_penalty,
-        output_file=output_file
+        output_file=output_file,
+        api_url=args.api_url,
     )
     end_time = time.time()
     

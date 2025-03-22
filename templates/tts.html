@@ -369,7 +369,7 @@
           responsive: true
         });
         
-        wavesurfer.load('/' + audioPath);
+        wavesurfer.load(audioPath);
         
         wavesurfer.on('ready', function() {
           const duration = wavesurfer.getDuration();
@@ -419,7 +419,7 @@
         // Set values
         document.getElementById('voice-name').textContent = response.voice.charAt(0).toUpperCase() + response.voice.slice(1);
         document.getElementById('generation-time').textContent = response.generation_time;
-        document.getElementById('download-link').href = '/' + response.output_file;
+        document.getElementById('download-link').href = response.output_file;
         
         // Initialize waveform
         initWaveSurfer(response.output_file);

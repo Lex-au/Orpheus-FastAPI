@@ -61,28 +61,17 @@ git clone https://github.com/Lex-au/Orpheus-FastAPI.git
 cd Orpheus-FastAPI
 ```
 
-2. Create a Python virtual environment:
+2. Install `pipx`
 ```bash
-# Using venv (Python's built-in virtual environment)
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Or using conda
-conda create -n orpheus-tts python=3.10
-conda activate orpheus-tts
+sudo apt-get install pipx
 ```
 
-3. Install PyTorch with CUDA support:
+3. Install `uv`
 ```bash
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pipx install uv
 ```
 
-4. Install other dependencies:
-```bash
-pip3 install -r requirements.txt
-```
-
-5. Set up the required directories:
+4. Set up the required directories:
 ```bash
 # Create directories for outputs and static files
 mkdir -p outputs static
@@ -92,12 +81,12 @@ mkdir -p outputs static
 
 Run the FastAPI server:
 ```bash
-python app.py
+uv run orpheus-fastapi
 ```
 
 Or with specific host/port:
 ```bash
-uvicorn app:app --host 0.0.0.0 --port 5005 --reload
+uv run orpheus-fastapi --host 0.0.0.0 --port 5005
 ```
 
 ![Terminal Output](https://lex-au.github.io/Orpheus-FastAPI/terminal.png)
