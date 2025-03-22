@@ -1,4 +1,9 @@
 __pycache__/
 *.pyo
 *.pyc
+output/*
+dist/
+.venv/
+.python-version
+*~
 
