@@ -1,0 +1,6 @@
+/outputs
+/.idea
+/tts_engine/__pycache__
+/__pycache__
+restart.flag
+.env
