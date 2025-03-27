@@ -114,6 +114,18 @@ async def create_speech_api(request: SpeechRequest):
         filename=f"{request.voice}_{timestamp}.wav"
     )
 
+@app.get("/v1/audio/voices")
+async def list_voices():
+    """Return list of available voices"""
+    if not AVAILABLE_VOICES or len(AVAILABLE_VOICES) == 0:
+        raise HTTPException(status_code=404, detail="No voices available")
+    return JSONResponse(
+        content={
+            "status": "ok",
+            "voices": AVAILABLE_VOICES
+        }
+    )
+
 # Legacy API endpoint for compatibility
 @app.post("/speak")
 async def speak(request: Request):
