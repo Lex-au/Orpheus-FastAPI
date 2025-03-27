@@ -1,0 +1,64 @@
+services:
+  orpheus-fastapi:
+    container_name: orpheus-fastapi
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    ports:
+      - "5005:5005"
+    environment:
+      # Server connection settings
+      - ORPHEUS_API_URL=http://llama-cpp-server:5006/v1/completions
+      - ORPHEUS_API_TIMEOUT=120 # You should scale this value based on max tokens and your inference speed
+      # Generation parameters
+      - ORPHEUS_MAX_TOKENS=8192 # If you want longer completions, increase this value
+      - ORPHEUS_TEMPERATURE=0.6
+      - ORPHEUS_TOP_P=0.9
+      - ORPHEUS_SAMPLE_RATE=24000
+      - ORPHEUS_MODEL_NAME=Orpheus-3b-FT-Q2_K.gguf # (Change here requires changes below)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    depends_on:
+      - llama-cpp-server
+
+  llama-cpp-server:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    ports:
+      - "5006:5006"
+    volumes:
+      - ./models:/models
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    command: -m /models/Orpheus-3b-FT-Q2_K.gguf --port 5006 --host 0.0.0.0 --n-gpu-layers 29
+
+  model-init:
+    image: curlimages/curl:latest
+    user: ${UID}:${GID}
+    volumes:
+      - ./models:/app/models
+    working_dir: /app
+    command: >
+      sh -c '
+      if [ ! -f /app/models/Orpheus-3b-FT-Q2_K.gguf ]; then
+        echo "Downloading model file..."
+        wget -P /app/models https://huggingface.co/lex-au/Orpheus-3b-FT-Q2_K.gguf/resolve/main/Orpheus-3b-FT-Q2_K.gguf
+      else
+        echo "Model file already exists"
+      fi'
+    restart: "no"
+    

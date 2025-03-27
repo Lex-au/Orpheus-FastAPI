@@ -11,14 +11,30 @@ from dotenv import load_dotenv
 
 # Function to ensure .env file exists
 def ensure_env_file_exists():
-    """Create a default .env file if one doesn't exist"""
+    """Create a .env file from defaults and OS environment variables"""
     if not os.path.exists(".env") and os.path.exists(".env.example"):
         try:
-            # Copy .env.example to .env
+            # 1. Create default env dictionary from .env.example
+            default_env = {}
             with open(".env.example", "r") as example_file:
-                with open(".env", "w") as env_file:
-                    env_file.write(example_file.read())
-            print("✅ Created default configuration file at .env")
+                for line in example_file:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key = line.split("=")[0].strip()
+                        default_env[key] = line.split("=", 1)[1].strip()
+
+            # 2. Override defaults with Docker environment variables if they exist
+            final_env = default_env.copy()
+            for key in default_env:
+                if key in os.environ:
+                    final_env[key] = os.environ[key]
+
+            # 3. Write dictionary to .env file in env format
+            with open(".env", "w") as env_file:
+                for key, value in final_env.items():
+                    env_file.write(f"{key}={value}\n")
+                    
+            print("✅ Created default .env file from .env.example and environment variables.")
         except Exception as e:
             print(f"⚠️ Error creating default .env file: {e}")
 

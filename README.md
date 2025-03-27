@@ -57,6 +57,8 @@ Listen to sample outputs with different voices and emotions:
 ```
 Orpheus-FastAPI/
 ├── app.py                # FastAPI server and endpoints
+├── docker-compose.yml    # Docker compose configuration
+├── Dockerfile.gpu        # GPU-enabled Docker image
 ├── requirements.txt      # Dependencies
 ├── static/               # Static assets (favicon, etc.)
 ├── outputs/              # Generated audio files
@@ -74,7 +76,15 @@ Orpheus-FastAPI/
 
 - Python 3.8-3.11 (Python 3.12 is not supported due to removal of pkgutil.ImpImporter)
 - CUDA-compatible GPU (recommended: RTX series for best performance)
-- Separate LLM inference server running the Orpheus model (e.g., LM Studio or llama.cpp server)
+- Using docker compose or separate LLM inference server running the Orpheus model (e.g., LM Studio or llama.cpp server)
+
+### 🐳 Docker compose
+
+The docker compose file orchestrates the Orpheus-FastAPI for audio and a llama.cpp inference server for the base model token generation. The GGUF model is downloaded with the model-init service.
+
+```bash
+docker compose up --build
+```
 
 ### Installation
 
@@ -271,7 +281,7 @@ You can easily integrate this TTS solution with [OpenWebUI](https://github.com/o
 
 ### External Inference Server
 
-This application requires a separate LLM inference server running the Orpheus model. You can use:
+This application requires a separate LLM inference server running the Orpheus model. For easy setup, use Docker Compose, which automatically handles this for you. Alternatively, you can use:
 
 - [GPUStack](https://github.com/gpustack/gpustack) - GPU optimised LLM inference server (My pick) - supports LAN/WAN tensor split parallelisation
 - [LM Studio](https://lmstudio.ai/) - Load the GGUF model and start the local server
@@ -291,9 +301,9 @@ The inference server should be configured to expose an API endpoint that this Fa
 
 ### Environment Variables
 
-You can configure the system using environment variables or a `.env` file:
+Configure in docker compose, if using docker. Not using docker; create a `.env` file:
 
-- `ORPHEUS_API_URL`: URL of the LLM inference API (tts_engine/inference.py)
+- `ORPHEUS_API_URL`: URL of the LLM inference API (default in Docker: http://llama-cpp-server:5006/v1/completions)
 - `ORPHEUS_API_TIMEOUT`: Timeout in seconds for API requests (default: 120)
 - `ORPHEUS_MAX_TOKENS`: Maximum tokens to generate (default: 8192)
 - `ORPHEUS_TEMPERATURE`: Temperature for generation (default: 0.6)
@@ -301,6 +311,7 @@ You can configure the system using environment variables or a `.env` file:
 - `ORPHEUS_SAMPLE_RATE`: Audio sample rate in Hz (default: 24000)
 - `ORPHEUS_PORT`: Web server port (default: 5005)
 - `ORPHEUS_HOST`: Web server host (default: 0.0.0.0)
+- `ORPHEUS_MODEL_NAME`: Model name for inference server
 
 The system now supports loading environment variables from a `.env` file in the project root, making it easier to configure without modifying system-wide environment settings. See `.env.example` for a template.
 
