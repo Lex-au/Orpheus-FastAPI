@@ -83,10 +83,14 @@ Orpheus-FastAPI/
 The docker compose file orchestrates the Orpheus-FastAPI for audio and a llama.cpp inference server for the base model token generation. The GGUF model is downloaded with the model-init service.
 
 ```bash
+cp .env.example .env # Nothing needs to be changed, but the file is required
+```
+
+```bash
 docker compose up --build
 ```
 
-### Installation
+### FastAPI Service Native Installation
 
 1. Clone the repository:
 ```bash

@@ -6,16 +6,10 @@ services:
       dockerfile: Dockerfile.gpu
     ports:
       - "5005:5005"
+    env_file:
+      - .env
     environment:
-      # Server connection settings
       - ORPHEUS_API_URL=http://llama-cpp-server:5006/v1/completions
-      - ORPHEUS_API_TIMEOUT=120 # You should scale this value based on max tokens and your inference speed
-      # Generation parameters
-      - ORPHEUS_MAX_TOKENS=8192 # If you want longer completions, increase this value
-      - ORPHEUS_TEMPERATURE=0.6
-      - ORPHEUS_TOP_P=0.9
-      - ORPHEUS_SAMPLE_RATE=24000
-      - ORPHEUS_MODEL_NAME=Orpheus-3b-FT-Q2_K.gguf # (Change here requires changes below)
     deploy:
       resources:
         reservations:
@@ -25,7 +19,8 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
     depends_on:
-      - llama-cpp-server
+      llama-cpp-server:
+        condition: service_started
 
   llama-cpp-server:
     image: ghcr.io/ggml-org/llama.cpp:server-cuda
@@ -33,6 +28,8 @@ services:
       - "5006:5006"
     volumes:
       - ./models:/models
+    env_file:
+      - .env
     depends_on:
       model-init:
         condition: service_completed_successfully
@@ -44,7 +41,14 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
-    command: -m /models/Orpheus-3b-FT-Q2_K.gguf --port 5006 --host 0.0.0.0 --n-gpu-layers 29
+    command: >
+      -m /models/${ORPHEUS_MODEL_NAME}
+      --port 5006 
+      --host 0.0.0.0 
+      --n-gpu-layers 29
+      --ctx-size ${ORPHEUS_MAX_TOKENS}
+      --n-predict ${ORPHEUS_MAX_TOKENS}
+      --rope-scaling linear
 
   model-init:
     image: curlimages/curl:latest
@@ -54,9 +58,9 @@ services:
     working_dir: /app
     command: >
       sh -c '
-      if [ ! -f /app/models/Orpheus-3b-FT-Q2_K.gguf ]; then
+      if [ ! -f /app/models/${ORPHEUS_MODEL_NAME} ]; then
         echo "Downloading model file..."
-        wget -P /app/models https://huggingface.co/lex-au/Orpheus-3b-FT-Q2_K.gguf/resolve/main/Orpheus-3b-FT-Q2_K.gguf
+        wget -P /app/models https://huggingface.co/lex-au/${ORPHEUS_MODEL_NAME}/resolve/main/${ORPHEUS_MODEL_NAME}
       else
         echo "Model file already exists"
       fi'
