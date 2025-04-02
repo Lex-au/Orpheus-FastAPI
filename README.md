@@ -140,6 +140,7 @@ The server provides an OpenAI-compatible API endpoint at `/v1/audio/speech`:
 ```bash
 curl http://localhost:5005/v1/audio/speech \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your_api_key_here" \
   -d '{
     "model": "orpheus",
     "input": "Hello world! This is a test of the Orpheus TTS system.",
@@ -165,6 +166,7 @@ Additionally, a simpler `/speak` endpoint is available:
 ```bash
 curl -X POST http://localhost:5005/speak \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your_api_key_here" \
   -d '{
     "text": "Hello world! This is a test.",
     "voice": "tara"
@@ -265,7 +267,7 @@ You can easily integrate this TTS solution with [OpenWebUI](https://github.com/o
 2. In OpenWebUI, go to Admin Panel > Settings > Audio
 3. Change TTS from Web API to OpenAI
 4. Set APIBASE URL to your server address (e.g., `http://localhost:5005/v1`)
-5. API Key can be set to "not-needed"
+5. Set API Key to your configured API key or "not-needed" if API key authentication is not enabled
 6. Set TTS Voice to one of the available voices: `tara`, `leah`, `jess`, `leo`, `dan`, `mia`, `zac`, or `zoe`
 7. Set TTS Model to `tts-1`
 
@@ -295,6 +297,7 @@ You can configure the system using environment variables or a `.env` file:
 
 - `ORPHEUS_API_URL`: URL of the LLM inference API (tts_engine/inference.py)
 - `ORPHEUS_API_TIMEOUT`: Timeout in seconds for API requests (default: 120)
+- `ORPHEUS_API_KEY`: API key for authentication with the OpenAI-compatible API (optional)
 - `ORPHEUS_MAX_TOKENS`: Maximum tokens to generate (default: 8192)
 - `ORPHEUS_TEMPERATURE`: Temperature for generation (default: 0.6)
 - `ORPHEUS_TOP_P`: Top-p sampling parameter (default: 0.9)

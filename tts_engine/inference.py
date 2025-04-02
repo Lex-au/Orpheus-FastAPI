@@ -85,9 +85,17 @@ API_URL = os.environ.get("ORPHEUS_API_URL")
 if not API_URL:
     print("WARNING: ORPHEUS_API_URL not set. API calls will fail until configured.")
 
+# Get API key from environment
+API_KEY = os.environ.get("ORPHEUS_API_KEY")
+if not API_KEY:
+    print("WARNING: ORPHEUS_API_KEY not set. API calls may fail if the endpoint requires authentication.")
+
+# Set up headers with authentication if API key is provided
 HEADERS = {
     "Content-Type": "application/json"
 }
+if API_KEY:
+    HEADERS["Authorization"] = f"Bearer {API_KEY}"
 
 # Request timeout settings
 try:
@@ -252,6 +260,12 @@ def generate_tokens_from_api(prompt: str, voice: str = DEFAULT_VOICE, temperatur
             
             if response.status_code != 200:
                 print(f"Error: API request failed with status code {response.status_code}")
+                if response.status_code == 401:
+                    print(f"Authentication failed. Please check your API key in the .env file.")
+                    return
+                elif response.status_code == 403:
+                    print(f"Authorization failed. Your API key may not have access to this resource.")
+                    return
                 print(f"Error details: {response.text}")
                 # Retry on server errors (5xx) but not on client errors (4xx)
                 if response.status_code >= 500:

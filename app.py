@@ -7,6 +7,7 @@ import time
 import asyncio
 from datetime import datetime
 from typing import List, Optional
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 
 # Function to ensure .env file exists
@@ -28,7 +29,7 @@ ensure_env_file_exists()
 # Load environment variables from .env file
 load_dotenv(override=True)
 
-from fastapi import FastAPI, Request, Form, HTTPException, Depends
+from fastapi import FastAPI, Request, Form, HTTPException, Depends, Security
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -59,6 +60,33 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # Setup templates
 templates = Jinja2Templates(directory="templates")
 
+# API key authentication
+security = HTTPBearer(auto_error=False)
+
+# Get API key from environment
+API_KEY = os.environ.get("ORPHEUS_API_KEY")
+
+# Function to verify API key
+async def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security)):
+    """
+    Verify the API key from the Authorization header.
+    If no API key is configured, authentication is skipped.
+    """
+    # If no API key is configured, skip authentication
+    if not API_KEY:
+        return True
+    
+    # If API key is configured but no credentials provided, raise 401
+    if not credentials:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing API key. Please provide an API key in the Authorization header."
+        )
+    
+    # Verify the API key
+    if credentials.credentials != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
 # API models
 class SpeechRequest(BaseModel):
     input: str
@@ -75,7 +103,7 @@ class APIResponse(BaseModel):
 
 # OpenAI-compatible API endpoint
 @app.post("/v1/audio/speech")
-async def create_speech_api(request: SpeechRequest):
+async def create_speech_api(request: SpeechRequest, authorized: bool = Depends(verify_api_key)):
     """
     Generate speech from text using the Orpheus TTS model.
     Compatible with OpenAI's /v1/audio/speech endpoint.
@@ -116,7 +144,7 @@ async def create_speech_api(request: SpeechRequest):
 
 # Legacy API endpoint for compatibility
 @app.post("/speak")
-async def speak(request: Request):
+async def speak(request: Request, authorized: bool = Depends(verify_api_key)):
     """Legacy endpoint for compatibility with existing clients"""
     data = await request.json()
     text = data.get("text", "")
