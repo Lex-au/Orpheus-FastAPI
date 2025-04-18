@@ -1,0 +1,56 @@
+services:
+  orpheus-fastapi:
+    container_name: orpheus-fastapi
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu  
+    ports:
+      - "5005:5005"
+    env_file:
+      - .env
+    environment:
+      - ORPHEUS_API_URL=http://llama-cpp-server:5006/v1/completions
+    restart: unless-stopped
+    depends_on:
+      llama-cpp-server:
+        condition: service_started
+
+  llama-cpp-server:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    ports:
+      - "5006:5006"
+    volumes:
+      - ./models:/models
+    env_file:
+      - .env
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    command: >
+      -m /models/${ORPHEUS_MODEL_NAME}
+      --host 0.0.0.0
+      --port 5006
+      --ctx-size ${ORPHEUS_MAX_TOKENS}
+      --n-predict ${ORPHEUS_MAX_TOKENS}
+      --threads ${LLAMA_CPU_THREADS:-6}
+      --threads-batch ${LLAMA_CPU_THREADS:-6}
+      --rope-scaling linear
+      --no-mmap
+      --no-slots
+      --no-webui
+  model-init:
+    image: curlimages/curl:latest
+    user: ${UID}:${GID}
+    volumes:
+      - ./models:/app/models
+    working_dir: /app
+    command: >
+      sh -c '
+      if [ ! -f /app/models/${ORPHEUS_MODEL_NAME} ]; then
+        echo "Downloading model file..."
+        wget -P /app/models https://huggingface.co/lex-au/${ORPHEUS_MODEL_NAME}/resolve/main/${ORPHEUS_MODEL_NAME}
+      else
+        echo "Model file already exists"
+      fi'
+    restart: "no"
