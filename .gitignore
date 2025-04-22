@@ -4,3 +4,10 @@ __pycache__/
 venv/
 models/
 *.gguf
+outputs/
+output_long*.txt
+*.txt
+jinja
+*.zsh
+*.bak
+*.sav

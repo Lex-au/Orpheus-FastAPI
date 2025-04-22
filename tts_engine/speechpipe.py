@@ -17,10 +17,32 @@ def is_reloader_process():
 # Set a flag to avoid repeat messages
 IS_RELOADER = is_reloader_process()
 
+# Detect hardware capabilities
+APPLE_SILICON = torch.backends.mps.is_available()
+CUDA_AVAILABLE = torch.cuda.is_available()
+
+# Set device for model processing
+if APPLE_SILICON:
+    DEVICE = "mps"
+    if not IS_RELOADER:
+        print("🍎 Using Apple Silicon MPS for speech generation")
+elif CUDA_AVAILABLE:
+    DEVICE = "cuda"
+    if not IS_RELOADER:
+        print("🖥️ Using CUDA for speech generation")
+else:
+    DEVICE = "cpu"
+    if not IS_RELOADER:
+        print("⚙️ Using CPU for speech generation")
+
+# Check if CoreML should be enabled
+# USE_COREML = APPLE_SILICON and os.environ.get("ORPHEUS_USE_COREML", "1") == "1"
+# CoreML logic removed
+
 # Try to enable torch.compile if PyTorch 2.0+ is available
 TORCH_COMPILE_AVAILABLE = False
 try:
-    if hasattr(torch, 'compile'):
+    if hasattr(torch, 'compile') and not APPLE_SILICON:  # torch.compile not fully supported on MPS yet
         TORCH_COMPILE_AVAILABLE = True
         if not IS_RELOADER:
             print("PyTorch 2.0+ detected, torch.compile is available")
@@ -30,29 +52,58 @@ except:
 # Try to enable CUDA graphs if available
 CUDA_GRAPHS_AVAILABLE = False
 try:
-    if torch.cuda.is_available() and hasattr(torch.cuda, 'make_graphed_callables'):
+    if CUDA_AVAILABLE and hasattr(torch.cuda, 'make_graphed_callables'):
         CUDA_GRAPHS_AVAILABLE = True
         if not IS_RELOADER:
             print("CUDA graphs support is available")
 except:
     pass
 
-model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").eval()
+# Load the model with appropriate device placement
+base_model = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").eval()
+base_model = base_model.to(DEVICE)
 
-# Check if CUDA is available and set device accordingly
-snac_device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-if not IS_RELOADER:
-    print(f"Using device: {snac_device}")
-model = model.to(snac_device)
+# Assign base_model directly as the model to use
+model = base_model
 
-# Disable torch.compile as it requires Triton which isn't installed
-# We'll use regular PyTorch optimization techniques instead
+# Check if CoreML wrapper should be used
+# if USE_COREML:
+#     try:
+#         from .coreml_wrapper import CoreMLWrapper
+#         # Wrap the base model with CoreML for Apple Silicon
+#         model = CoreMLWrapper(base_model, device=DEVICE)
+#         if model.use_coreml and model.coreml_model is not None:
+#             if not IS_RELOADER:
+#                 print("🧠 Using CoreML Neural Engine acceleration!")
+#         else:
+#             if not IS_RELOADER:
+#                 print("CoreML model not available, using MPS acceleration instead")
+#     except ImportError:
+#         # If CoreML wrapper is not available, use the base model
+#         model = base_model
+#         if not IS_RELOADER:
+#             print("CoreML wrapper not available, using standard PyTorch backend")
+# else:
+#     # Use base model directly
+#     model = base_model
+
 if not IS_RELOADER:
-    print("Using standard PyTorch optimizations (torch.compile disabled)")
+    print(f"SNAC model loaded directly on {DEVICE} (CoreML export disabled)")
+
+# Disable torch.compile for MPS as it's not fully supported
+if APPLE_SILICON:
+    if not IS_RELOADER:
+        print("Using standard PyTorch optimizations for Apple Silicon")
+elif TORCH_COMPILE_AVAILABLE:
+    if not IS_RELOADER:
+        print("Using torch.compile for optimized performance")
+else:
+    if not IS_RELOADER:
+        print("Using standard PyTorch optimizations")
 
 # Prepare CUDA streams for parallel processing if available
 cuda_stream = None
-if snac_device == "cuda":
+if CUDA_AVAILABLE:
     cuda_stream = torch.cuda.Stream()
     if not IS_RELOADER:
         print("Using CUDA stream for parallel processing")
@@ -60,8 +111,8 @@ if snac_device == "cuda":
 
 def convert_to_audio(multiframe, count):
     """
-    Optimized version of convert_to_audio that eliminates inefficient tensor operations
-    and reduces CPU-GPU transfers for much faster inference on high-end GPUs.
+    Optimized version of convert_to_audio that supports Apple Silicon MPS and
+    eliminates inefficient tensor operations for much faster inference.
     """
     if len(multiframe) < 7:
         return None
@@ -70,12 +121,12 @@ def convert_to_audio(multiframe, count):
     frame = multiframe[:num_frames*7]
     
     # Pre-allocate tensors instead of incrementally building them
-    codes_0 = torch.zeros(num_frames, dtype=torch.int32, device=snac_device)
-    codes_1 = torch.zeros(num_frames * 2, dtype=torch.int32, device=snac_device)
-    codes_2 = torch.zeros(num_frames * 4, dtype=torch.int32, device=snac_device)
+    codes_0 = torch.zeros(num_frames, dtype=torch.int32, device=DEVICE)
+    codes_1 = torch.zeros(num_frames * 2, dtype=torch.int32, device=DEVICE)
+    codes_2 = torch.zeros(num_frames * 4, dtype=torch.int32, device=DEVICE)
     
     # Use vectorized operations where possible
-    frame_tensor = torch.tensor(frame, dtype=torch.int32, device=snac_device)
+    frame_tensor = torch.tensor(frame, dtype=torch.int32, device=DEVICE)
     
     # Direct indexing is much faster than concatenation in a loop
     for j in range(num_frames):
@@ -107,27 +158,33 @@ def convert_to_audio(multiframe, count):
         torch.any(codes[2] < 0) or torch.any(codes[2] > 4096)):
         return None
 
-    # Use CUDA stream for parallel processing if available
-    stream_ctx = torch.cuda.stream(cuda_stream) if cuda_stream is not None else torch.no_grad()
+    # Context manager depends on device type
+    if CUDA_AVAILABLE:
+        stream_ctx = torch.cuda.stream(cuda_stream)
+    else:
+        stream_ctx = torch.inference_mode()
     
-    with stream_ctx, torch.inference_mode():
-        # Decode the audio
-        audio_hat = model.decode(codes)
+    with stream_ctx:
+        # Decode the audio using the base model directly
+        audio_hat = model.decode(codes) # model is now directly base_model
         
         # Extract the relevant slice and efficiently convert to bytes
         # Keep data on GPU as long as possible
         audio_slice = audio_hat[:, :, 2048:4096]
         
-        # Process on GPU if possible, with minimal data transfer
-        if snac_device == "cuda":
+        # Process based on device type to minimize data transfers
+        if CUDA_AVAILABLE:
             # Scale directly on GPU
             audio_int16_tensor = (audio_slice * 32767).to(torch.int16)
             # Only transfer the final result to CPU
             audio_bytes = audio_int16_tensor.cpu().numpy().tobytes()
+        elif APPLE_SILICON:
+            # For MPS, we need to go through CPU
+            audio_int16_tensor = (audio_slice * 32767).to(torch.int16)
+            audio_bytes = audio_int16_tensor.detach().cpu().numpy().tobytes()
         else:
-            # For non-CUDA devices, fall back to the original approach
-            detached_audio = audio_slice.detach().cpu()
-            audio_np = detached_audio.numpy()
+            # For CPU, simpler pathway
+            audio_np = audio_slice.detach().numpy()
             audio_int16 = (audio_np * 32767).astype(np.int16)
             audio_bytes = audio_int16.tobytes()
             
@@ -189,7 +246,7 @@ async def tokens_decoder(token_gen):
     """Optimized token decoder with early first-chunk processing for lower latency"""
     buffer = []
     count = 0
-    
+
     # Track if first chunk has been processed
     first_chunk_processed = False
     
@@ -288,15 +345,69 @@ async def tokens_decoder(token_gen):
         audio_samples = convert_to_audio(padded_buffer, count)
         if audio_samples is not None:
             yield audio_samples
+
+def reset_state():
+    """Reset all state between batch processing."""
+    global token_id_cache, cuda_stream
+    
+    # Clear the token ID cache
+    token_id_cache.clear()
+    
+    # Reset CUDA stream if available
+    if CUDA_AVAILABLE and cuda_stream is not None:
+        cuda_stream.synchronize()
+        cuda_stream = torch.cuda.Stream()
+        
+        # Clear CUDA cache 
+        torch.cuda.empty_cache()
+    
+    # For Apple Silicon, clear MPS cache if available
+    if APPLE_SILICON:
+        try:
+            # This is the proper way to clear MPS cache in PyTorch 2.0+
+            torch.mps.empty_cache()
+        except:
+            # Fallback for older PyTorch versions or if the operation fails
+            pass
+            
+    # Reset CoreML state if needed
+    # if USE_COREML and isinstance(model, CoreMLWrapper) and model.use_coreml:
+    #     try:
+    #         # CoreML resources are generally managed by the OS
+    #         # but we'll manually trigger garbage collection to be safe
+    #         import gc
+    #         gc.collect()
+    #     except:
+    #         pass
+    
+    # Force garbage collection
+    import gc
+    gc.collect()
+
 # ------------------ Synchronous Tokens Decoder Wrapper ------------------ #
 def tokens_decoder_sync(syn_token_gen):
-    """Optimized synchronous decoder with larger queue and parallel processing"""
-    # Use a larger queue for RTX 4090 to maximize GPU utilization
-    max_queue_size = 32 if snac_device == "cuda" else 8
-    audio_queue = queue.Queue(maxsize=max_queue_size)
+    """Optimized synchronous decoder with hardware-specific optimizations"""
+    # Set queue size based on hardware
+    if APPLE_SILICON:
+        import psutil
+        ram_gb = psutil.virtual_memory().total / (1024**3)
+        if ram_gb >= 64:  # High-memory Apple Silicon
+            max_queue_size = 64
+            batch_size = 32
+        elif ram_gb >= 32:  # Mid-range Apple Silicon
+            max_queue_size = 48
+            batch_size = 24
+        else:  # Base model
+            max_queue_size = 32
+            batch_size = 16
+    elif CUDA_AVAILABLE:
+        max_queue_size = 32
+        batch_size = 16
+    else:  # CPU fallback
+        max_queue_size = 8
+        batch_size = 4
     
-    # Collect tokens in batches for higher throughput
-    batch_size = 16 if snac_device == "cuda" else 4
+    audio_queue = queue.Queue(maxsize=max_queue_size)
     
     # Convert the synchronous token generator into an async generator with batching
     async def async_token_gen():
@@ -340,13 +451,16 @@ def tokens_decoder_sync(syn_token_gen):
     def run_async():
         asyncio.run(async_producer())
 
-    # Use a higher priority thread for RTX 4090 to ensure it stays fed with work
+    # Create thread with appropriate priority
     thread = threading.Thread(target=run_async)
     thread.daemon = True  # Allow the thread to be terminated when the main thread exits
     thread.start()
 
-    # Use larger buffer for final audio assembly
-    buffer_size = 5
+    # Use hardware-specific buffer sizes
+    if APPLE_SILICON:
+        buffer_size = 8  # Larger buffer for smoother playback on Apple Silicon
+    else:
+        buffer_size = 5
     audio_buffer = []
     
     while True:
