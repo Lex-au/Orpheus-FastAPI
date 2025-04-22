@@ -401,6 +401,46 @@ Note: Repetition penalty is hardcoded to 1.1 and cannot be changed through envir
 
 Make sure the `ORPHEUS_API_URL` points to your running inference server.
 
+## Apple Silicon Optimization
+
+This project includes special optimizations for Apple Silicon (M1/M2/M3) devices:
+
+### Metal Performance Shaders (MPS)
+
+The application automatically uses Apple's Metal Performance Shaders (MPS) backend when running on Apple Silicon. This provides significant performance improvements over CPU-only execution.
+
+### CoreML Neural Engine Acceleration
+
+For even better performance, you can enable Neural Engine acceleration via CoreML:
+
+1. Install the required package:
+   ```bash
+   pip install coremltools
+   ```
+
+2. Export the model to CoreML format (one-time setup):
+   ```bash
+   python export_coreml.py
+   ```
+
+3. Enable CoreML acceleration:
+   ```bash
+   export ORPHEUS_USE_COREML=1
+   ```
+
+This optional step can provide an additional 30-50% speedup by offloading computation to the Neural Engine, which is specifically designed for machine learning workloads.
+
+### Memory Optimization
+
+The application automatically detects high-memory Apple Silicon devices (M1 Pro/Max/Ultra, M2 Pro/Max/Ultra, M3 Pro/Max/Ultra) and uses more aggressive memory optimization strategies, including:
+
+- Parallel batch processing
+- Larger audio buffers
+- Pre-allocation for crossfading
+- Optimized tensor operations
+
+These optimizations are particularly effective on devices with 32GB+ of unified memory.
+
 ## Development
 
 ### Project Components

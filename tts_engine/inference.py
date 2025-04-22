@@ -10,9 +10,39 @@ import argparse
 import threading
 import queue
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Any, Optional, Generator, Union, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Any, Optional, Generator, Union, Tuple, AsyncGenerator
 from dotenv import load_dotenv
+import nltk
+import multiprocessing
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Helper to ensure NLTK data is downloaded
+_nltk_punkt_downloaded = False
+def ensure_nltk_punkt():
+    global _nltk_punkt_downloaded
+    if not _nltk_punkt_downloaded:
+        try:
+            nltk.data.find('tokenizers/punkt')
+        except nltk.downloader.DownloadError:
+            print("NLTK 'punkt' tokenizer model not found. Downloading...")
+            try:
+                nltk.download('punkt', quiet=True)
+                print("'punkt' model downloaded successfully.")
+            except Exception as e:
+                print(f"Error downloading NLTK 'punkt' model: {e}")
+                print("Sentence tokenization might be less accurate.")
+        except LookupError: # Handle case where nltk_data path isn't configured
+             print("NLTK 'punkt' model not found. Downloading...")
+             try:
+                 nltk.download('punkt', quiet=True)
+                 print("'punkt' model downloaded successfully.")
+             except Exception as e:
+                 print(f"Error downloading NLTK 'punkt' model: {e}")
+                 print("Sentence tokenization might be less accurate.")
+        _nltk_punkt_downloaded = True
 
 # Helper to detect if running in Uvicorn's reloader
 def is_reloader_process():
@@ -32,9 +62,54 @@ load_dotenv()
 import torch
 import psutil
 
+# Device selection with support for Apple Silicon MPS
+# Define device globally for consistent use throughout
+DEVICE = "cpu"  # Default to CPU, will be updated based on availability
+
 # Detect if we're on a high-end system based on hardware capabilities
 HIGH_END_GPU = False
-if torch.cuda.is_available():
+APPLE_SILICON = False
+
+# Check for Apple Silicon MPS support first
+if torch.backends.mps.is_available():
+    DEVICE = "mps"
+    APPLE_SILICON = True
+    
+    # Get Apple Silicon details
+    import platform
+    import subprocess
+    
+    # Get chip model and memory
+    chip_model = platform.processor()
+    try:
+        # Get memory info using sysctl
+        mem_cmd = subprocess.run(["sysctl", "hw.memsize"], capture_output=True, text=True)
+        if mem_cmd.returncode == 0:
+            mem_bytes = int(mem_cmd.stdout.split(':')[1].strip())
+            mem_gb = mem_bytes / (1024**3)
+        else:
+            mem_gb = psutil.virtual_memory().total / (1024**3)
+    except Exception:
+        mem_gb = psutil.virtual_memory().total / (1024**3)
+    
+    # Detect high-end Apple Silicon (M1 Pro/Max/Ultra, M2 Pro/Max/Ultra, M3 Pro/Max/Ultra)
+    if "Pro" in chip_model or "Max" in chip_model or "Ultra" in chip_model or mem_gb >= 32:
+        HIGH_END_GPU = True
+        if not IS_RELOADER:
+            print(f"🍎 Hardware: High-end Apple Silicon detected")
+            print(f"📊 Chip: {chip_model}")
+            print(f"📊 RAM: {mem_gb:.2f} GB unified memory")
+            print("🚀 Using high-performance Apple Silicon optimizations")
+    else:
+        if not IS_RELOADER:
+            print(f"🍎 Hardware: Apple Silicon detected")
+            print(f"📊 Chip: {chip_model}")
+            print(f"📊 RAM: {mem_gb:.2f} GB unified memory")
+            print("🚀 Using Apple Silicon optimizations")
+            
+# Then check for CUDA GPU
+elif torch.cuda.is_available():
+    DEVICE = "cuda"
     # Get GPU properties
     props = torch.cuda.get_device_properties(0)
     gpu_name = props.name
@@ -67,7 +142,7 @@ else:
     ram_gb = psutil.virtual_memory().total / (1024**3)
     
     if not IS_RELOADER:
-        print(f"🖥️ Hardware: CPU only (No CUDA GPU detected)")
+        print(f"🖥️ Hardware: CPU only (No GPU acceleration detected)")
         print(f"📊 CPU: {cpu_cores} cores, {cpu_threads} threads")
         print(f"📊 RAM: {ram_gb:.2f} GB")
         print("⚙️ Using CPU-optimized settings")
@@ -134,10 +209,78 @@ if not IS_RELOADER:
     print(f"  REPETITION_PENALTY: {REPETITION_PENALTY}")
 
 # Parallel processing settings
-NUM_WORKERS = 4 if HIGH_END_GPU else 2
+import multiprocessing
+
+# Determine optimal settings based on hardware
+CPU_CORES = multiprocessing.cpu_count()
+
+# For Apple Silicon, use more aggressive settings depending on the model
+if APPLE_SILICON:
+    # Optimize for Apple Silicon based on memory
+    ram_gb = psutil.virtual_memory().total / (1024**3)
+    if ram_gb >= 64:  # High-memory M1 Max/Ultra, M2 Max/Ultra, M3 Max/Ultra (64GB+)
+        NUM_WORKERS = max(8, min(CPU_CORES-2, 12))
+        BATCH_SIZE = 64
+        AUDIO_QUEUE_SIZE = 200
+    elif ram_gb >= 32:  # Mid-range models (32GB)
+        NUM_WORKERS = max(4, min(CPU_CORES-2, 8))
+        BATCH_SIZE = 48
+        AUDIO_QUEUE_SIZE = 150
+    else:  # Base models
+        NUM_WORKERS = max(2, min(CPU_CORES-1, 4))
+        BATCH_SIZE = 32
+        AUDIO_QUEUE_SIZE = 100
+elif HIGH_END_GPU:  # High-end CUDA GPU
+    NUM_WORKERS = 4
+    BATCH_SIZE = 32
+    AUDIO_QUEUE_SIZE = 100
+else:  # Regular CUDA or CPU
+    NUM_WORKERS = 2
+    BATCH_SIZE = 16
+    AUDIO_QUEUE_SIZE = 50
+
+# Buffer size for audio processing
+if APPLE_SILICON and psutil.virtual_memory().total >= (64 * 1024**3):  # 64GB+ RAM
+    BUFFER_SIZE_MB = 4  # 4MB buffer
+elif APPLE_SILICON or HIGH_END_GPU:
+    BUFFER_SIZE_MB = 2  # 2MB buffer
+else:
+    BUFFER_SIZE_MB = 1  # 1MB buffer
+
+BUFFER_MAX_SIZE = BUFFER_SIZE_MB * 1024 * 1024
+
+# Maximum number of characters per batch for NLTK sentence splitting
+try:
+    MAX_BATCH_CHARS = int(os.environ.get("ORPHEUS_MAX_BATCH_CHARS", "600"))
+    if MAX_BATCH_CHARS < 100 or MAX_BATCH_CHARS > 2000:
+        print(f"WARNING: Invalid ORPHEUS_MAX_BATCH_CHARS value ({MAX_BATCH_CHARS}), should be between 100-2000. Using 600 as fallback.")
+        MAX_BATCH_CHARS = 600
+except (ValueError, TypeError):
+    print("WARNING: Invalid ORPHEUS_MAX_BATCH_CHARS value, using 600 as fallback")
+    MAX_BATCH_CHARS = 600
+
+# Crossfade duration in milliseconds for stitching audio batches
+try:
+    CROSSFADE_MS = int(os.environ.get("ORPHEUS_CROSSFADE_MS", "30"))
+    if CROSSFADE_MS < 10 or CROSSFADE_MS > 200:
+        print(f"WARNING: Invalid ORPHEUS_CROSSFADE_MS value ({CROSSFADE_MS}), should be between 10-200. Using 30 as fallback.")
+        CROSSFADE_MS = 30
+except (ValueError, TypeError):
+    print("WARNING: Invalid ORPHEUS_CROSSFADE_MS value, using 30 as fallback")
+    CROSSFADE_MS = 30
+
+# Helper function to generate equal power fade curves using sine/cosine
+def generate_equal_power_fade_curves(num_samples):
+    """Generate fade-out and fade-in curves using sine/cosine for equal power crossfading."""
+    # Create a linear ramp from 0 to pi/2
+    ramp = np.linspace(0, np.pi/2, num_samples)
+    # Use sine for fade-out and cosine for fade-in to maintain equal power
+    fade_out = np.sin(ramp)
+    fade_in = np.cos(ramp)
+    return fade_out, fade_in
 
 # Define voices by language
-ENGLISH_VOICES = ["tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"]
+ENGLISH_VOICES = ["tara", "kaya", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"]
 FRENCH_VOICES = ["pierre", "amelie", "marie"]
 GERMAN_VOICES = ["jana", "thomas", "max"]
 KOREAN_VOICES = ["유나", "준서"]
@@ -215,56 +358,93 @@ class PerformanceMonitor:
         # Estimate audio duration based on audio chunks (each chunk is ~0.085s of audio)
         est_duration = self.audio_chunks * 0.085
         
-        print(f"Progress: {tokens_per_sec:.1f} tokens/sec, est. {est_duration:.1f}s audio generated, {self.token_count} tokens, {self.audio_chunks} chunks in {elapsed:.1f}s")
+        # print(f"Progress: {tokens_per_sec:.1f} tokens/sec, est. {est_duration:.1f}s audio generated, {self.token_count} tokens, {self.audio_chunks} chunks in {elapsed:.1f}s")
 
 # Create global performance monitor
 perf_monitor = PerformanceMonitor()
 
+# --- Read System Prompt --- 
+SYSTEM_PROMPT_CONTENT = None
+PAST_CONTEXT = None # For long texts, we are going to store the past context in this variable and pass it to the model as a system prompt.
+SYSTEM_PROMPT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "System_Prompt.md")
+
+try:
+    if os.path.exists(SYSTEM_PROMPT_PATH):
+        with open(SYSTEM_PROMPT_PATH, 'r', encoding='utf-8') as f:
+            SYSTEM_PROMPT_CONTENT = f.read()
+            if not IS_RELOADER:
+                logger.info(f"Successfully loaded system prompt from {SYSTEM_PROMPT_PATH}")
+    else:
+        if not IS_RELOADER:
+            logger.warning(f"System prompt file not found at {SYSTEM_PROMPT_PATH}. Proceeding without system prompt.")
+except Exception as e:
+    if not IS_RELOADER:
+        logger.error(f"Error reading system prompt file {SYSTEM_PROMPT_PATH}: {e}")
+# --- End System Prompt Read --- 
+
 def format_prompt(prompt: str, voice: str = DEFAULT_VOICE) -> str:
-    """Format prompt for Orpheus model with voice prefix and special tokens."""
+    """Format prompt for Orpheus model with voice prefix and special tokens.
+       Restored based on backup file.
+    """
     # Validate voice and provide fallback
     if voice not in AVAILABLE_VOICES:
-        print(f"Warning: Voice '{voice}' not recognized. Using '{DEFAULT_VOICE}' instead.")
+        logger.warning(f"Voice '{voice}' not recognized. Using '{DEFAULT_VOICE}' instead.")
         voice = DEFAULT_VOICE
         
-    # Format similar to how engine_class.py does it with special tokens
+    # Format similar to original backup
     formatted_prompt = f"{voice}: {prompt}"
     
-    # Add special token markers for the Orpheus-FASTAPI
-    special_start = "<|audio|>"  # Using the additional_special_token from config
-    special_end = "<|eot_id|>"   # Using the eos_token from config
+    # Add special token markers required by Orpheus
+    special_start = "<|audio|>"
+    special_end = "<|eot_id|>"
     
-    return f"{special_start}{formatted_prompt}{special_end}"
+    return f"{special_start}{formatted_prompt}{special_end}" # Restored original format
 
 def generate_tokens_from_api(prompt: str, voice: str = DEFAULT_VOICE, temperature: float = TEMPERATURE, 
                            top_p: float = TOP_P, max_tokens: int = MAX_TOKENS, 
-                           repetition_penalty: float = REPETITION_PENALTY) -> Generator[str, None, None]:
-    """Generate tokens from text using OpenAI-compatible API with optimized streaming and retry logic."""
+                           repetition_penalty: float = REPETITION_PENALTY,
+                           context_prompt: Optional[str] = None) -> Generator[str, None, None]:
+    """Generate tokens from text using OpenAI-compatible API (prompt format).
+       Uses the separate 'system_prompt' payload field for system/context info if available.
+    """
     start_time = time.time()
-    formatted_prompt = format_prompt(prompt, voice)
-    print(f"Generating speech for: {formatted_prompt}")
-    
-    # Optimize the token generation for GPUs
-    if HIGH_END_GPU:
-        # Use more aggressive parameters for faster generation on high-end GPUs
-        print("Using optimized parameters for high-end GPU")
-    elif torch.cuda.is_available():
-        print("Using optimized parameters for GPU acceleration")
-    
-    # Create the request payload (model field may not be required by some endpoints but included for compatibility)
+    # Format the main part of the user prompt (e.g., <|audio|>voice: text<|eot_id|>)
+    formatted_user_prompt = format_prompt(prompt, voice)
+    print(f"Generating speech for user prompt (voice: {voice}): {prompt[:80]}...")
+
+    # Combine system prompt and context prompt for the dedicated field
+    system_and_context = ""
+    if SYSTEM_PROMPT_CONTENT:
+        system_and_context += SYSTEM_PROMPT_CONTENT
+        print("Using system prompt.")
+    if context_prompt:
+        # Add clear separation if both system and context exist
+        if system_and_context:
+            system_and_context += "\n\n[Previous context:]\n"
+        else: # Only context exists
+            system_and_context += "[Previous context:]\n"
+        system_and_context += context_prompt
+        print("Using context prompt.")
+
+    # Create the request payload 
     payload = {
-        "prompt": formatted_prompt,
+        "prompt": formatted_user_prompt, # Main user prompt here
         "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": top_p,
         "repeat_penalty": repetition_penalty,
-        "stream": True  # Always stream for better performance
+        "stream": True
     }
     
-    # Add model field - this is ignored by many local inference servers for /v1/completions
-    # but included for compatibility with OpenAI API and some servers that may use it
+    # Add the dedicated system_prompt field if we have content for it
+    if system_and_context:
+        payload["system"] = system_and_context
+        print(f"Sending system_prompt field: {system_and_context[:100]}...")
+
+    # Add model field - optional but good practice
     model_name = os.environ.get("ORPHEUS_MODEL_NAME", "Orpheus-3b-FT-Q8_0.gguf")
-    payload["model"] = model_name
+    if model_name:
+        payload["model"] = model_name
     
     # Session for connection pooling and retry logic
     session = requests.Session()
@@ -274,7 +454,7 @@ def generate_tokens_from_api(prompt: str, voice: str = DEFAULT_VOICE, temperatur
     
     while retry_count < max_retries:
         try:
-            # Make the API request with streaming and timeout
+            # Make the API request
             response = session.post(
                 API_URL, 
                 headers=HEADERS, 
@@ -284,72 +464,66 @@ def generate_tokens_from_api(prompt: str, voice: str = DEFAULT_VOICE, temperatur
             )
             
             if response.status_code != 200:
-                print(f"Error: API request failed with status code {response.status_code}")
-                print(f"Error details: {response.text}")
-                # Retry on server errors (5xx) but not on client errors (4xx)
+                error_detail = response.text
+                logger.error(f"API Error ({response.status_code}): {error_detail}")
+                # Removed the messages vs prompt check as we now use prompt
                 if response.status_code >= 500:
                     retry_count += 1
-                    wait_time = 2 ** retry_count  # Exponential backoff
-                    print(f"Retrying in {wait_time} seconds...")
+                    wait_time = 2 ** retry_count
+                    logger.info(f"Retrying in {wait_time} seconds... (attempt {retry_count+1}/{max_retries})")
                     time.sleep(wait_time)
                     continue
                 return
             
-            # Process the streamed response with better buffering
-            buffer = ""
+            # Process the streamed response (parsing logic remains the same, checking for 'text')
             token_counter = 0
-            
-            # Iterate through the response to get tokens
             for line in response.iter_lines():
                 if line:
                     line_str = line.decode('utf-8')
                     if line_str.startswith('data: '):
-                        data_str = line_str[6:]  # Remove the 'data: ' prefix
-                        
+                        data_str = line_str[6:]
                         if data_str.strip() == '[DONE]':
                             break
-                            
                         try:
                             data = json.loads(data_str)
                             if 'choices' in data and len(data['choices']) > 0:
-                                token_chunk = data['choices'][0].get('text', '')
-                                for token_text in token_chunk.split('>'):
-                                    token_text = f'{token_text}>'
+                                choice = data['choices'][0]
+                                token_chunk = choice.get('text', '') # Expecting 'text' for /v1/completions
+                                
+                                if token_chunk and token_chunk.startswith("<custom_token_") and token_chunk.endswith(">"):
                                     token_counter += 1
                                     perf_monitor.add_tokens()
+                                    yield token_chunk
 
-                                    if token_text:
-                                        yield token_text
                         except json.JSONDecodeError as e:
-                            print(f"Error decoding JSON: {e}")
+                            logger.error(f"Error decoding JSON stream data: {e}")
                             continue
             
-            # Generation completed successfully
             generation_time = time.time() - start_time
             tokens_per_second = token_counter / generation_time if generation_time > 0 else 0
             print(f"Token generation complete: {token_counter} tokens in {generation_time:.2f}s ({tokens_per_second:.1f} tokens/sec)")
             return
             
         except requests.exceptions.Timeout:
-            print(f"Request timed out after {REQUEST_TIMEOUT} seconds")
+            logger.warning(f"Request timed out after {REQUEST_TIMEOUT} seconds")
             retry_count += 1
             if retry_count < max_retries:
                 wait_time = 2 ** retry_count
-                print(f"Retrying in {wait_time} seconds... (attempt {retry_count+1}/{max_retries})")
+                logger.info(f"Retrying in {wait_time} seconds... (attempt {retry_count+1}/{max_retries})")
                 time.sleep(wait_time)
             else:
-                print("Max retries reached. Token generation failed.")
+                logger.error("Max retries reached for timeout. Token generation failed.")
                 return
                 
-        except requests.exceptions.ConnectionError:
-            print(f"Connection error to API at {API_URL}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error connecting to API at {API_URL}: {e}")
             retry_count += 1
             if retry_count < max_retries:
                 wait_time = 2 ** retry_count
-                print(f"Retrying in {wait_time} seconds... (attempt {retry_count+1}/{max_retries})")
+                logger.info(f"Retrying in {wait_time} seconds... (attempt {retry_count+1}/{max_retries})")
                 time.sleep(wait_time)
             else:
-                print("Max retries reached. Token generation failed.")
+                logger.error("Max retries reached for connection error. Token generation failed.")
                 return
 
 # The turn_token_into_id function is now imported from speechpipe.py
@@ -367,7 +541,7 @@ def convert_to_audio(multiframe: List[int], count: int) -> Optional[bytes]:
         
     return result
 
-async def tokens_decoder(token_gen) -> Generator[bytes, None, None]:
+async def tokens_decoder(token_gen) -> AsyncGenerator[bytes, None]:
     """Simplified token decoder with early first-chunk processing for lower latency."""
     buffer = []
     count = 0
@@ -391,12 +565,12 @@ async def tokens_decoder(token_gen) -> Generator[bytes, None, None]:
             token_count += 1
             
             # Log throughput periodically
-            current_time = time.time()
-            if current_time - last_log_time > 5.0:  # Every 5 seconds
-                elapsed = current_time - start_time
-                if elapsed > 0:
-                    print(f"Token processing rate: {token_count/elapsed:.1f} tokens/second")
-                last_log_time = current_time
+            # current_time = time.time()
+            # if current_time - last_log_time > 5.0:  # Every 5 seconds
+            #     elapsed = current_time - start_time
+            #     if elapsed > 0:
+            #         print(f"Token processing rate: {token_count/elapsed:.1f} tokens/second")
+            #     last_log_time = current_time
             
             # Different processing paths based on whether first chunk has been processed
             if not first_chunk_processed:
@@ -417,8 +591,8 @@ async def tokens_decoder(token_gen) -> Generator[bytes, None, None]:
                     buffer_to_proc = buffer[-min_frames_subsequent:]
                     
                     # Debug output to help diagnose issues
-                    if count % 28 == 0:
-                        print(f"Processing buffer with {len(buffer_to_proc)} tokens, total collected: {len(buffer)}")
+                    # if count % 28 == 0:
+                        # print(f"Processing buffer with {len(buffer_to_proc)} tokens, total collected: {len(buffer)}")
                     
                     # Process the tokens
                     audio_samples = convert_to_audio(buffer_to_proc, count)
@@ -427,8 +601,8 @@ async def tokens_decoder(token_gen) -> Generator[bytes, None, None]:
 
 def tokens_decoder_sync(syn_token_gen, output_file=None):
     """Optimized synchronous wrapper with parallel processing and efficient file I/O."""
-    # Use a larger queue for high-end systems
-    queue_size = 100 if HIGH_END_GPU else 50
+    # Use hardware-optimized queue size
+    queue_size = AUDIO_QUEUE_SIZE
     audio_queue = queue.Queue(maxsize=queue_size)
     audio_segments = []
     
@@ -442,8 +616,8 @@ def tokens_decoder_sync(syn_token_gen, output_file=None):
         wav_file.setsampwidth(2)
         wav_file.setframerate(SAMPLE_RATE)
     
-    # Batch processing of tokens for improved throughput
-    batch_size = 32 if HIGH_END_GPU else 16
+    # Use optimized batch processing
+    batch_size = BATCH_SIZE
     
     # Thread synchronization for proper completion detection
     producer_done_event = threading.Event()
@@ -479,16 +653,16 @@ def tokens_decoder_sync(syn_token_gen, output_file=None):
                     chunk_count += 1
                     
                     # Log performance periodically
-                    current_time = time.time()
-                    if current_time - last_log_time >= 3.0:  # Every 3 seconds
-                        elapsed = current_time - last_log_time
-                        if elapsed > 0:
-                            recent_chunks = chunk_count
-                            chunks_per_sec = recent_chunks / elapsed
-                            print(f"Audio generation rate: {chunks_per_sec:.2f} chunks/second")
-                        last_log_time = current_time
-                        # Reset chunk counter for next interval
-                        chunk_count = 0
+                    # current_time = time.time()
+                    # if current_time - last_log_time >= 3.0:  # Every 3 seconds
+                    #     elapsed = current_time - last_log_time
+                    #     if elapsed > 0:
+                    #         recent_chunks = chunk_count
+                    #         chunks_per_sec = recent_chunks / elapsed
+                    #         print(f"Audio generation rate: {chunks_per_sec:.2f} chunks/second")
+                    #     last_log_time = current_time 
+                    #     # Reset chunk counter for next interval
+                    #     chunk_count = 0
         except Exception as e:
             print(f"Error in token processing: {str(e)}")
             import traceback
@@ -514,10 +688,9 @@ def tokens_decoder_sync(syn_token_gen, output_file=None):
     # before the producer has had a chance to add anything
     producer_started_event.wait(timeout=5.0)
     
-    # Optimized I/O approach for all systems
-    # This approach is simpler and more reliable than separate code paths
+    # Use hardware-optimized buffer size
     write_buffer = bytearray()
-    buffer_max_size = 1024 * 1024  # 1MB max buffer size (adjustable)
+    buffer_max_size = BUFFER_MAX_SIZE
     
     # Keep track of the last time we checked for completion
     last_check_time = time.time()
@@ -624,201 +797,512 @@ import numpy as np
 from io import BytesIO
 import wave
 
-def split_text_into_sentences(text):
-    """Split text into sentences with a more reliable approach."""
-    # We'll use a simple approach that doesn't rely on variable-width lookbehinds
-    # which aren't supported in Python's regex engine
+# Map for NLTK language names (add more as needed/supported by punkt)
+NLTK_LANG_MAP = {
+    "english": "english",
+    "french": "french",
+    "german": "german",
+    "spanish": "spanish",
+    "italian": "italian",
+    # Add other languages if punkt models exist for them
+}
+
+def split_text_into_sentences(text: str, language: str = "english", max_chars_per_segment: int = MAX_BATCH_CHARS) -> List[str]:
+    """Split text into sentences using NLTK for better accuracy."""
+    ensure_nltk_punkt() # Make sure model is available
+
+    nltk_lang = NLTK_LANG_MAP.get(language, "english") # Default to English if mapped lang not found
+    print(f"Splitting text into sentences using NLTK for language: {nltk_lang}")
     
-    # First, split on common sentence ending punctuation
-    # This isn't perfect but works for most cases and avoids the regex error
-    parts = []
-    current_sentence = ""
+    try:
+        # Attempt to use the specified language model
+        sentences = nltk.sent_tokenize(text, language=nltk_lang)
+        print(f"Successfully tokenized using NLTK for language: {nltk_lang}")
+    except Exception as e:
+        # Fallback to default English model if specific language model fails or isn't available
+        print(f"Warning: Could not use NLTK tokenizer for language '{nltk_lang}'. Falling back to English. Error: {e}")
+        try:
+            sentences = nltk.sent_tokenize(text)
+        except Exception as inner_e:
+            # If NLTK fails completely, fallback to a very basic split as a last resort
+            print(f"ERROR: NLTK sentence tokenization failed entirely: {inner_e}. Using basic fallback.")
+            sentences = text.split('. ') # Very basic fallback
+
+    # Filter out empty sentences and strip whitespace
+    sentences = [s.strip() for s in sentences if s.strip()]
     
-    for char in text:
-        current_sentence += char
-        
-        # If we hit a sentence ending followed by a space, consider this a potential sentence end
-        if char in (' ', '\n', '\t') and len(current_sentence) > 1:
-            prev_char = current_sentence[-2]
-            if prev_char in ('.', '!', '?'):
-                # Check if this is likely a real sentence end and not an abbreviation
-                # (Simple heuristic: if there's a space before the period, it's likely a real sentence end)
-                if len(current_sentence) > 3 and current_sentence[-3] not in ('.', ' '):
-                    parts.append(current_sentence.strip())
-                    current_sentence = ""
+    # Create segments that respect the max_chars_per_segment limit
+    segments = []
+    current_segment = ""
     
-    # Add any remaining text
-    if current_sentence.strip():
-        parts.append(current_sentence.strip())
-    
-    # Combine very short segments to avoid tiny audio files
-    min_chars = 20  # Minimum reasonable sentence length
-    combined_sentences = []
-    i = 0
-    
-    while i < len(parts):
-        current = parts[i]
-        
-        # If this is a short sentence and not the last one, combine with next
-        while i < len(parts) - 1 and len(current) < min_chars:
-            i += 1
-            current += " " + parts[i]
+    for sentence in sentences:
+        # If a single sentence exceeds the limit, we need to split it
+        if len(sentence) > max_chars_per_segment:
+            # If we have a current segment, add it first
+            if current_segment:
+                segments.append(current_segment)
+                current_segment = ""
             
-        combined_sentences.append(current)
-        i += 1
+            # Split the long sentence into chunks
+            words = sentence.split()
+            current_chunk = ""
+            
+            for word in words:
+                # If adding this word would exceed the limit, start a new chunk
+                if len(current_chunk) + len(word) + 1 > max_chars_per_segment:
+                    if current_chunk:
+                        segments.append(current_chunk)
+                    current_chunk = word
+                else:
+                    # Add word to current chunk with a space if needed
+                    current_chunk = f"{current_chunk} {word}" if current_chunk else word
+            
+            # Add the last chunk if it exists
+            if current_chunk:
+                segments.append(current_chunk)
+        else:
+            # Check if adding this sentence would exceed the limit
+            if current_segment:
+                potential_length = len(current_segment) + 1 + len(sentence)
+                if potential_length > max_chars_per_segment:
+                    segments.append(current_segment)
+                    current_segment = sentence
+                else:
+                    current_segment = f"{current_segment} {sentence}"
+            else:
+                current_segment = sentence
     
-    return combined_sentences
+    # Add the last segment if it exists
+    if current_segment:
+        segments.append(current_segment)
+    
+    # Verify that no segment exceeds the limit
+    for i, segment in enumerate(segments):
+        if len(segment) > max_chars_per_segment:
+            print(f"Warning: Segment {i} exceeds max_chars_per_segment ({len(segment)} > {max_chars_per_segment})")
+            # Split the segment into smaller chunks
+            words = segment.split()
+            new_segments = []
+            current_chunk = ""
+            
+            for word in words:
+                if len(current_chunk) + len(word) + 1 > max_chars_per_segment:
+                    if current_chunk:
+                        new_segments.append(current_chunk)
+                    current_chunk = word
+                else:
+                    current_chunk = f"{current_chunk} {word}" if current_chunk else word
+            
+            if current_chunk:
+                new_segments.append(current_chunk)
+            
+            # Replace the long segment with the new segments
+            segments[i:i+1] = new_segments
+    
+    print(f"Split text into {len(segments)} segments with max length {max_chars_per_segment}")
+    return segments
+
+def cleanup_between_batches():
+    """Reset all state between batch processing."""
+    # Reset the performance monitor
+    global perf_monitor
+    perf_monitor = PerformanceMonitor()
+    
+    # Import here to avoid circular imports
+    from .speechpipe import reset_state
+    # Reset the speechpipe state
+    reset_state()
+    
+    # Force garbage collection
+    import gc
+    gc.collect()
 
 def generate_speech_from_api(prompt, voice=DEFAULT_VOICE, output_file=None, temperature=TEMPERATURE, 
                      top_p=TOP_P, max_tokens=MAX_TOKENS, repetition_penalty=None, 
-                     use_batching=True, max_batch_chars=1000):
-    """Generate speech from text using Orpheus model with performance optimizations."""
+                     use_batching=True, max_batch_chars=MAX_BATCH_CHARS):
+    """Generate speech from text using Orpheus model with performance optimizations and NLTK splitting."""
     print(f"Starting speech generation for '{prompt[:50]}{'...' if len(prompt) > 50 else ''}'")
-    print(f"Using voice: {voice}, GPU acceleration: {'Yes (High-end)' if HIGH_END_GPU else 'Yes' if torch.cuda.is_available() else 'No'}")
+    print(f"Using voice: {voice}, GPU acceleration: {'Yes (High-end)' if HIGH_END_GPU else 'Yes' if torch.cuda.is_available() or torch.backends.mps.is_available() else 'No'}")
     
-    # Reset performance monitor
+    # Reset performance monitor at start
     global perf_monitor
     perf_monitor = PerformanceMonitor()
     
     start_time = time.time()
     
-    # For shorter text, use the standard non-batched approach
+    all_audio_segments = [] # To store the final small chunks for return/streaming
+
+    # Determine language for splitting
+    generation_language = VOICE_TO_LANGUAGE.get(voice, "english")
+
+    # For shorter text or disabled batching, use the standard non-batched approach
     if not use_batching or len(prompt) < max_batch_chars:
-        # Note: we ignore any provided repetition_penalty and always use the hardcoded value
-        # This ensures consistent quality regardless of what might be passed in
-        result = tokens_decoder_sync(
+        print("Processing text as a single batch.")
+        # Note: repetition_penalty is ignored (uses hardcoded 1.1)
+        all_audio_segments = tokens_decoder_sync(
             generate_tokens_from_api(
                 prompt=prompt, 
                 voice=voice,
                 temperature=temperature,
                 top_p=top_p,
                 max_tokens=max_tokens,
-                repetition_penalty=REPETITION_PENALTY  # Always use hardcoded value
+                repetition_penalty=REPETITION_PENALTY # Fixed value
             ),
-            output_file=output_file
+            output_file=output_file # Pass file handle if saving
         )
         
-        # Report final performance metrics
-        end_time = time.time()
-        total_time = end_time - start_time
-        print(f"Total speech generation completed in {total_time:.2f} seconds")
-        
-        return result
-    
-    # For longer text, use sentence-based batching
-    print(f"Using sentence-based batching for text with {len(prompt)} characters")
-    
-    # Split the text into sentences
-    sentences = split_text_into_sentences(prompt)
-    print(f"Split text into {len(sentences)} segments")
-    
-    # Create batches by combining sentences up to max_batch_chars
-    batches = []
-    current_batch = ""
-    
-    for sentence in sentences:
-        # If adding this sentence would exceed the batch size, start a new batch
-        if len(current_batch) + len(sentence) > max_batch_chars and current_batch:
-            batches.append(current_batch)
-            current_batch = sentence
-        else:
-            # Add separator space if needed
-            if current_batch:
-                current_batch += " "
-            current_batch += sentence
-    
-    # Add the last batch if it's not empty
-    if current_batch:
-        batches.append(current_batch)
-    
-    print(f"Created {len(batches)} batches for processing")
-    
-    # Process each batch and collect audio segments
-    all_audio_segments = []
-    batch_temp_files = []
-    
-    for i, batch in enumerate(batches):
-        print(f"Processing batch {i+1}/{len(batches)} ({len(batch)} characters)")
-        
-        # Create a temporary file for this batch if an output file is requested
-        temp_output_file = None
         if output_file:
-            temp_output_file = f"outputs/temp_batch_{i}_{int(time.time())}.wav"
-            batch_temp_files.append(temp_output_file)
+             pass # File writing is handled internally by tokens_decoder_sync
+        else:
+             pass # Segments are already in all_audio_segments
+
+    # For longer text, use sentence-based batching with NLTK and crossfading
+    else:
+        print(f"Using sentence-based batching for text with {len(prompt)} characters (limit: {max_batch_chars})")
         
-        # Generate speech for this batch
-        batch_segments = tokens_decoder_sync(
-            generate_tokens_from_api(
-                prompt=batch,
-                voice=voice,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-                repetition_penalty=REPETITION_PENALTY
-            ),
-            output_file=temp_output_file
-        )
+        # Split the text into segments using NLTK, passing the limit
+        segments = split_text_into_sentences(prompt, language=generation_language, max_chars_per_segment=max_batch_chars)
+        print(f"Split text into {len(segments)} segments using NLTK ({generation_language}).")
         
-        # Add to our collection
-        all_audio_segments.extend(batch_segments)
-    
-    # If an output file was requested, stitch together the temporary files
-    if output_file and batch_temp_files:
-        # Stitch together WAV files
-        stitch_wav_files(batch_temp_files, output_file)
+        # Process each segment and collect audio segments
+        all_complete_batch_audio = [] # Store complete audio (bytes) for each batch
+        batch_temp_files = []
+        all_results = [(None, None, None, None)] * len(segments) # Pre-allocate results list
         
-        # Clean up temporary files
-        for temp_file in batch_temp_files:
-            try:
-                os.remove(temp_file)
-            except Exception as e:
-                print(f"Warning: Could not remove temporary file {temp_file}: {e}")
-    
-    # Report final performance metrics
+        # Determine if we should use parallel processing
+        use_parallel = APPLE_SILICON and len(segments) > 1 and psutil.virtual_memory().total >= (32 * 1024**3)
+        
+        if use_parallel:
+            print(f"Using parallel processing with {NUM_WORKERS} workers for {len(segments)} segments")
+            
+            # Define a function to process a single segment
+            def process_segment(segment_text, index, previous_segment_text):
+                print(f"Starting parallel processing of segment {index+1}/{len(segments)} ({len(segment_text)} characters)")
+                
+                # Clean up state before processing
+                cleanup_between_batches()
+                
+                # --- Prepare context from previous segment --- 
+                context_for_next = ""
+                if previous_segment_text:
+                    try:
+                        # Extract last sentence as context
+                        # Make sure NLTK data is available (should be loaded globally)
+                        ensure_nltk_punkt() 
+                        prev_sentences = nltk.sent_tokenize(previous_segment_text)
+                        if prev_sentences:
+                             # Use only the last sentence as context
+                             context_for_next = prev_sentences[-1].strip()
+                             print(f"Segment {index+1}: Using last sentence of previous segment as context.")
+                    except Exception as e:
+                         logger.warning(f"Segment {index+1}: Could not extract context from previous segment: {e}")
+                # --- End context preparation --- 
+                
+                # Create a temporary file if needed
+                temp_file = None
+                if output_file:
+                    temp_file = f"outputs/temp_batch_{index}_{int(time.time())}.wav"
+                    # Note: Appending to batch_temp_files needs thread-safety or post-processing
+                
+                # Process the segment, passing the context
+                segments_output = tokens_decoder_sync(
+                    generate_tokens_from_api(
+                        prompt=segment_text,
+                        voice=voice,
+                        temperature=temperature,
+                        top_p=top_p,
+                        max_tokens=max_tokens,
+                        repetition_penalty=REPETITION_PENALTY,
+                        context_prompt=context_for_next # Pass context here
+                    ),
+                    output_file=temp_file
+                )
+                
+                # Combine the audio fragments
+                complete_audio = b"".join(segments_output)
+                print(f"Completed parallel processing of segment {index+1}")
+                
+                return index, complete_audio, segments_output, temp_file
+            
+            # Use ThreadPoolExecutor for parallel processing
+            with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+                # Submit all segments for processing, passing previous segment text
+                future_to_segment = {
+                    executor.submit(process_segment, 
+                                    segment, 
+                                    i, 
+                                    segments[i-1] if i > 0 else None): # Pass previous segment
+                    i for i, segment in enumerate(segments)
+                }
+                
+                # Process segments as they complete
+                temp_batch_files_collector = {} # Collect temp files safely
+                for future in as_completed(future_to_segment):
+                    try:
+                        idx, complete_audio, segments_output, temp_file = future.result()
+                        # Store the results in the pre-allocated list using the index
+                        all_results[idx] = (idx, complete_audio, segments_output, temp_file)
+                        if temp_file:
+                           temp_batch_files_collector[idx] = temp_file
+                    except Exception as e:
+                        idx = future_to_segment[future] # Get index from map
+                        print(f"Error processing segment {idx+1}: {e}")
+                        # Store error indication if needed, e.g., all_results[idx] = (idx, None, None, None)
+                
+                # Extract results in original order from the pre-allocated list
+                all_complete_batch_audio = [audio for idx, audio, _, _ in all_results if audio is not None]
+                batch_temp_files = [temp_batch_files_collector[i] for i in sorted(temp_batch_files_collector) if temp_batch_files_collector[i] is not None]
+                
+                if not output_file:
+                    # Flatten the segments in original order
+                    temp_segments = []
+                    for idx, _, segments_output, _ in all_results:
+                        if segments_output is not None:
+                           temp_segments.extend(segments_output)
+                    all_audio_segments = temp_segments
+        else:
+            # Process segments sequentially (original logic, but add context passing)
+            for i, segment in enumerate(segments):
+                print(f"Processing segment {i+1}/{len(segments)} ({len(segment)} characters)")
+                
+                # Clean up state between batches
+                cleanup_between_batches()
+                
+                # --- Prepare context from previous segment --- 
+                context_for_next = ""
+                if i > 0 and segments[i-1]: # Check if previous segment exists
+                    try:
+                        ensure_nltk_punkt()
+                        prev_sentences = nltk.sent_tokenize(segments[i-1])
+                        if prev_sentences:
+                             context_for_next = prev_sentences[-1].strip()
+                             print(f"Segment {i+1}: Using last sentence of previous segment as context.")
+                    except Exception as e:
+                         logger.warning(f"Segment {i+1}: Could not extract context from previous segment: {e}")
+                # --- End context preparation --- 
+
+                # Create a temporary file ONLY if a final output file is requested
+                temp_output_file_for_batch = None
+                if output_file:
+                    temp_output_file_for_batch = f"outputs/temp_batch_{i}_{int(time.time())}.wav"
+                    batch_temp_files.append(temp_output_file_for_batch)
+                
+                # Generate speech for this segment, passing context
+                batch_segments = tokens_decoder_sync(
+                    generate_tokens_from_api(
+                        prompt=segment,
+                        voice=voice,
+                        temperature=temperature,
+                        top_p=top_p,
+                        max_tokens=max_tokens,
+                        repetition_penalty=REPETITION_PENALTY,
+                        context_prompt=context_for_next # Pass context here
+                    ),
+                    output_file=temp_output_file_for_batch
+                )
+                
+                # Combine the small segments from this batch into one bytes object
+                complete_batch_audio_bytes = b"".join(batch_segments)
+                all_complete_batch_audio.append(complete_batch_audio_bytes)
+                
+                # Also keep track of small segments if not writing to file and no crossfading needed later
+                if not output_file:
+                     all_audio_segments.extend(batch_segments)
+            
+            # Explicitly clear segments list after processing all segments
+            segments = None
+            import gc
+            gc.collect()
+
+        # --- Post-Batch Processing --- 
+        if output_file:
+            # If an output file was requested, stitch together the temporary batch files
+            if batch_temp_files:
+                stitch_wav_files(batch_temp_files, output_file)
+                # Clean up temporary files
+                for temp_file in batch_temp_files:
+                    try: os.remove(temp_file) 
+                    except Exception as e: print(f"Warning: Could not remove temp file {temp_file}: {e}")
+            # In file output mode, the final return value isn't the audio data itself
+            all_audio_segments = [] # Clear segments as data is in the file
+        
+        elif len(all_complete_batch_audio) > 1:
+             # If NO output file AND more than one batch was processed, apply crossfading
+             print(f"Applying in-memory crossfade to {len(all_complete_batch_audio)} audio batches.")
+             try:
+                 # Convert bytes to numpy arrays
+                 batch_arrays = [np.frombuffer(b, dtype=np.int16) for b in all_complete_batch_audio if b] # Filter empty
+                 
+                 if len(batch_arrays) > 1:
+                     # Apply crossfading logic with optimizations for high-memory systems
+                     if APPLE_SILICON and psutil.virtual_memory().total >= (64 * 1024**3):
+                         # Pre-allocate the final array to avoid repeated concatenations
+                         # First calculate total length of all arrays minus crossfade regions
+                         crossfade_samples = int(SAMPLE_RATE * CROSSFADE_MS / 1000)
+                         total_samples = sum(len(arr) for arr in batch_arrays)
+                         # Subtract overlapping regions
+                         total_samples -= crossfade_samples * (len(batch_arrays) - 1)
+                         
+                         # Pre-allocate the final array
+                         print(f"Pre-allocating array for {total_samples} samples")
+                         final_audio_np = np.zeros(total_samples, dtype=np.int16)
+                         
+                         # Fill the array with crossfaded audio
+                         write_position = 0
+                         
+                         for i, audio_np in enumerate(batch_arrays):
+                             if i == 0:
+                                 # First segment - copy directly
+                                 final_audio_np[:len(audio_np)] = audio_np
+                                 write_position += len(audio_np) - crossfade_samples
+                             else:
+                                 # For other segments, apply crossfade
+                                 # Generate equal power fade curves
+                                 fade_out, fade_in = generate_equal_power_fade_curves(crossfade_samples)
+                                 
+                                 # Create crossfade region
+                                 prev_end = write_position
+                                 crossfade_region = (final_audio_np[prev_end:prev_end+crossfade_samples] * fade_out + 
+                                                    audio_np[:crossfade_samples] * fade_in).astype(np.int16)
+                                 
+                                 # Write crossfade region
+                                 final_audio_np[prev_end:prev_end+crossfade_samples] = crossfade_region
+                                 
+                                 # Write remainder of current segment
+                                 next_end = prev_end + crossfade_samples + len(audio_np) - crossfade_samples
+                                 final_audio_np[prev_end+crossfade_samples:next_end] = audio_np[crossfade_samples:]
+                                 
+                                 # Update write position
+                                 write_position = next_end
+                     else:
+                         # Use standard approach for systems with less memory
+                         final_audio_np = np.array([], dtype=np.int16)
+                         # Use the constant for crossfade duration
+                         crossfade_samples = int(SAMPLE_RATE * CROSSFADE_MS / 1000)
+                         print(f"Applying {CROSSFADE_MS}ms crossfade ({crossfade_samples} samples)")
+
+                         for i, audio_np in enumerate(batch_arrays):
+                             if i == 0:
+                                 final_audio_np = audio_np
+                             else:
+                                 # Apply crossfade
+                                 prev_audio_np = final_audio_np
+                                 current_audio_np = audio_np
+                                 
+                                 if len(prev_audio_np) >= crossfade_samples and len(current_audio_np) >= crossfade_samples:
+                                     # Generate equal power fade curves
+                                     fade_out, fade_in = generate_equal_power_fade_curves(crossfade_samples)
+                                     
+                                     crossfade_region = (prev_audio_np[-crossfade_samples:] * fade_out + 
+                                                        current_audio_np[:crossfade_samples] * fade_in).astype(np.int16)
+                                     
+                                     final_audio_np = np.concatenate([
+                                         prev_audio_np[:-crossfade_samples], 
+                                         crossfade_region, 
+                                         current_audio_np[crossfade_samples:]
+                                     ])
+                                 else:
+                                     # Segments too short for crossfade, concatenate directly
+                                     print(f"Warning: Segments too short for crossfade between batch {i-1} and {i}. Concatenating.")
+                                     final_audio_np = np.concatenate([prev_audio_np, current_audio_np])
+                                     
+                     # Convert final numpy array back to bytes and wrap in a list
+                     all_audio_segments = [final_audio_np.tobytes()]
+                     print("In-memory crossfading complete.")
+                     
+                     # Clear batch arrays to free memory
+                     batch_arrays = None
+                     all_complete_batch_audio = None
+                     gc.collect()
+                 else:
+                      # Only one valid batch array, use the original segments
+                      print("Only one batch generated after filtering, no crossfading needed.")
+                      pass 
+             except Exception as e:
+                  print(f"ERROR during in-memory crossfading: {e}. Returning raw concatenated segments.")
+                  # Fallback: return the original potentially discontinuous segments if crossfade fails
+                  all_audio_segments = [b"".join(all_audio_segments)] # Combine all small chunks
+
+    # --- Final Reporting --- 
     end_time = time.time()
     total_time = end_time - start_time
     
-    # Calculate combined duration
+    # Calculate combined duration from the final segments to be returned
     if all_audio_segments:
-        total_bytes = sum(len(segment) for segment in all_audio_segments)
-        duration = total_bytes / (2 * SAMPLE_RATE)  # 2 bytes per sample at 24kHz
-        print(f"Generated {len(all_audio_segments)} audio segments")
-        print(f"Generated {duration:.2f} seconds of audio in {total_time:.2f} seconds")
-        print(f"Realtime factor: {duration/total_time:.2f}x")
+        # Handle if crossfading resulted in a single large chunk
+        if len(all_audio_segments) == 1:
+             total_bytes = len(all_audio_segments[0])
+        else: # Original chunked segments
+             total_bytes = sum(len(segment) for segment in all_audio_segments)
         
+        if total_bytes > 0:
+             duration = total_bytes / (2 * SAMPLE_RATE) # 2 bytes per sample
+             print(f"Generated {len(all_audio_segments)} final audio segment(s)") # Correctly reports 1 segment after crossfade
+             print(f"Generated {duration:.2f} seconds of audio in {total_time:.2f} seconds")
+             if total_time > 0:
+                  realtime_factor = duration / total_time
+                  print(f"Realtime factor: {realtime_factor:.2f}x")
+                  if realtime_factor < 1.0:
+                      print("⚠️ Warning: Generation is slower than realtime")
+                  else:
+                      print(f"✓ Generation is {realtime_factor:.1f}x faster than realtime")
+             else:
+                  print("Generation time was negligible.")
+        else:
+            print("Warning: No audio data generated.")
+            
     print(f"Total speech generation completed in {total_time:.2f} seconds")
     
+    # Return the final audio segments (either original chunks or one combined chunk after crossfade)
     return all_audio_segments
 
-def stitch_wav_files(input_files, output_file, crossfade_ms=50):
+def stitch_wav_files(input_files, output_file):
     """Stitch multiple WAV files together with crossfading for smooth transitions."""
     if not input_files:
         return
         
-    print(f"Stitching {len(input_files)} WAV files together with {crossfade_ms}ms crossfade")
+    print(f"Stitching {len(input_files)} WAV files together with {CROSSFADE_MS}ms crossfade")
     
     # If only one file, just copy it
     if len(input_files) == 1:
         import shutil
         shutil.copy(input_files[0], output_file)
+        print(f"Only one input file, copied directly to {output_file}")
         return
     
-    # Convert crossfade_ms to samples
-    crossfade_samples = int(SAMPLE_RATE * crossfade_ms / 1000)
+    # Convert crossfade_ms to samples using the constant
+    crossfade_samples = int(SAMPLE_RATE * CROSSFADE_MS / 1000)
     print(f"Using {crossfade_samples} samples for crossfade at {SAMPLE_RATE}Hz")
     
     # Build the final audio in memory with crossfades
     final_audio = np.array([], dtype=np.int16)
     first_params = None
     
+    # Standard WAV parameters to enforce
+    standard_params = {
+        'nchannels': 1,
+        'sampwidth': 2,
+        'framerate': SAMPLE_RATE
+    }
+    
     for i, input_file in enumerate(input_files):
         try:
             with wave.open(input_file, 'rb') as wav:
+                # Get current file parameters
+                current_params = wav.getparams()
+                
+                # Check and standardize parameters
                 if first_params is None:
-                    first_params = wav.getparams()
-                elif wav.getparams() != first_params:
-                    print(f"Warning: WAV file {input_file} has different parameters")
-                    
+                    first_params = current_params
+                    # Verify first file meets our standards
+                    if (current_params.nchannels != standard_params['nchannels'] or
+                        current_params.sampwidth != standard_params['sampwidth'] or
+                        current_params.framerate != standard_params['framerate']):
+                        print(f"Warning: First WAV file {input_file} has non-standard parameters. Converting to standard format.")
+                elif current_params != first_params:
+                    print(f"Warning: WAV file {input_file} has different parameters. Converting to standard format.")
+                
+                # Read frames and convert to numpy array
                 frames = wav.readframes(wav.getnframes())
                 audio = np.frombuffer(frames, dtype=np.int16)
                 
@@ -828,9 +1312,8 @@ def stitch_wav_files(input_files, output_file, crossfade_ms=50):
                 else:
                     # Apply crossfade with previous segment
                     if len(final_audio) >= crossfade_samples and len(audio) >= crossfade_samples:
-                        # Create crossfade weights
-                        fade_out = np.linspace(1.0, 0.0, crossfade_samples)
-                        fade_in = np.linspace(0.0, 1.0, crossfade_samples)
+                        # Generate equal power fade curves
+                        fade_out, fade_in = generate_equal_power_fade_curves(crossfade_samples)
                         
                         # Apply crossfade
                         crossfade_region = (final_audio[-crossfade_samples:] * fade_out + 
@@ -855,7 +1338,10 @@ def stitch_wav_files(input_files, output_file, crossfade_ms=50):
             if first_params is None:
                 raise ValueError("No valid WAV files were processed")
                 
-            output_wav.setparams(first_params)
+            # Use standard parameters for output
+            output_wav.setnchannels(standard_params['nchannels'])
+            output_wav.setsampwidth(standard_params['sampwidth'])
+            output_wav.setframerate(standard_params['framerate'])
             output_wav.writeframes(final_audio.tobytes())
         
         print(f"Successfully stitched audio to {output_file} with crossfading")

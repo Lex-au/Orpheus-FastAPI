@@ -51,7 +51,16 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 import json
 
-from tts_engine import generate_speech_from_api, AVAILABLE_VOICES, DEFAULT_VOICE, VOICE_TO_LANGUAGE, AVAILABLE_LANGUAGES
+# Import from tts_engine with fallback values
+try:
+    from tts_engine import generate_speech_from_api, AVAILABLE_VOICES, DEFAULT_VOICE, VOICE_TO_LANGUAGE, AVAILABLE_LANGUAGES, MAX_BATCH_CHARS
+except ImportError as e:
+    # If MAX_BATCH_CHARS is missing, import what we can and define a fallback value
+    print(f"Warning: Import error - {e}")
+    from tts_engine import generate_speech_from_api, AVAILABLE_VOICES, DEFAULT_VOICE, VOICE_TO_LANGUAGE, AVAILABLE_LANGUAGES
+    # Use a fallback value - this should match the value in inference.py
+    MAX_BATCH_CHARS = 600
+    print(f"Using fallback value for MAX_BATCH_CHARS: {MAX_BATCH_CHARS}")
 
 # Create FastAPI app
 app = FastAPI(
@@ -96,7 +105,7 @@ async def create_speech_api(request: SpeechRequest):
     Generate speech from text using the Orpheus TTS model.
     Compatible with OpenAI's /v1/audio/speech endpoint.
     
-    For longer texts (>1000 characters), batched generation is used
+    For longer texts (>MAX_BATCH_CHARS characters), batched generation is used
     to improve reliability and avoid truncation issues.
     """
     if not request.input:
@@ -107,7 +116,7 @@ async def create_speech_api(request: SpeechRequest):
     output_path = f"outputs/{request.voice}_{timestamp}.wav"
     
     # Check if we should use batched generation
-    use_batching = len(request.input) > 1000
+    use_batching = len(request.input) > MAX_BATCH_CHARS
     if use_batching:
         print(f"Using batched generation for long text ({len(request.input)} characters)")
     
@@ -117,8 +126,7 @@ async def create_speech_api(request: SpeechRequest):
         prompt=request.input,
         voice=request.voice,
         output_file=output_path,
-        use_batching=use_batching,
-        max_batch_chars=1000  # Process in ~1000 character chunks (roughly 1 paragraph)
+        use_batching=use_batching
     )
     end = time.time()
     generation_time = round(end - start, 2)
@@ -160,7 +168,7 @@ async def speak(request: Request):
     output_path = f"outputs/{voice}_{timestamp}.wav"
     
     # Check if we should use batched generation for longer texts
-    use_batching = len(text) > 1000
+    use_batching = len(text) > MAX_BATCH_CHARS
     if use_batching:
         print(f"Using batched generation for long text ({len(text)} characters)")
     
@@ -170,8 +178,7 @@ async def speak(request: Request):
         prompt=text, 
         voice=voice, 
         output_file=output_path,
-        use_batching=use_batching,
-        max_batch_chars=1000
+        use_batching=use_batching
     )
     end = time.time()
     generation_time = round(end - start, 2)
@@ -226,7 +233,7 @@ async def save_config(request: Request):
     
     # Convert values to proper types
     for key, value in data.items():
-        if key in ["ORPHEUS_MAX_TOKENS", "ORPHEUS_API_TIMEOUT", "ORPHEUS_PORT", "ORPHEUS_SAMPLE_RATE"]:
+        if key in ["ORPHEUS_MAX_TOKENS", "ORPHEUS_API_TIMEOUT", "ORPHEUS_PORT", "ORPHEUS_SAMPLE_RATE", "ORPHEUS_MAX_BATCH_CHARS", "ORPHEUS_CROSSFADE_MS"]:
             try:
                 data[key] = str(int(value))
             except (ValueError, TypeError):
@@ -322,7 +329,7 @@ async def generate_from_web(
     output_path = f"outputs/{voice}_{timestamp}.wav"
     
     # Check if we should use batched generation for longer texts
-    use_batching = len(text) > 1000
+    use_batching = len(text) > MAX_BATCH_CHARS
     if use_batching:
         print(f"Using batched generation for long text from web form ({len(text)} characters)")
     
@@ -332,8 +339,7 @@ async def generate_from_web(
         prompt=text, 
         voice=voice, 
         output_file=output_path,
-        use_batching=use_batching,
-        max_batch_chars=1000
+        use_batching=use_batching
     )
     end = time.time()
     generation_time = round(end - start, 2)
