@@ -29,7 +29,8 @@ RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
 # Install PyTorch with CUDA support and other dependencies
-RUN pip3 install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 && \
+# Using CUDA 12.8 for Blackwell sm_120 support
+RUN pip3 install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128 && \
     pip3 install --no-cache-dir -r requirements.txt
 
 # Copy project files
@@ -38,7 +39,9 @@ COPY --chown=appuser:appuser . .
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
-    USE_GPU=true
+    USE_GPU=true \
+    CUDA_LAUNCH_BLOCKING=1 \
+    TORCH_USE_CUDA_DSA=1
 
 # Expose the port
 EXPOSE 5005
