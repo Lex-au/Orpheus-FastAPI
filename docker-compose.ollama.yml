@@ -1,0 +1,16 @@
+services:
+  orpheus-fastapi:
+    container_name: orpheus-fastapi
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+      # dockerfile: Dockerfile.gpu
+      # dockerfile: Dockerfile.gpu-rocm
+    ports:
+      - "5005:5005"
+    environment:
+      ORPHEUS_API_URL: http://host.docker.internal:11434/v1/completions
+      ORPHEUS_MODEL_NAME: legraphista/Orpheus # https://ollama.com/legraphista/Orpheus
+    volumes:
+      - ./outputs:/app/outputs
+    restart: always
