@@ -111,7 +111,7 @@ Orpheus-FastAPI/
 ### 🐳 Docker compose
 
 The docker compose file orchestrates the Orpheus-FastAPI for audio and a llama.cpp inference server for the base model token generation. The GGUF model is downloaded with the model-init service.
-There are three versions, two for machines that have access to GPU support `docker-compose-gpu.yaml`, `docker-compose-gpu-rocm.yml`  and one for CPU support only: `docker-compose-cpu.yaml`
+There are three versions, two for machines that have access to GPU support `docker-compose-gpu.yml`, `docker-compose-gpu-rocm.yml`  and one for CPU support only: `docker-compose-cpu.yaml`
 
 ```bash
 cp .env.example .env # Create your .env file from the example
@@ -138,7 +138,7 @@ docker compose -f docker-compose-gpu-rocm.yml up
 
 For CPU support run:
 ```bash
-docker compose -f docker-compose-cpu.yml up
+docker compose -f docker-compose-cpu.yaml up
 ```
 
 The system will automatically download the specified model from Hugging Face before starting the service.
